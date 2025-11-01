@@ -1,157 +1,149 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.30;
+pragma solidity ^0.8.24;
 
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+/**
+ * @title P2PLending (Celo Sepolia version)
+ * @notice P2P Lending tối giản dùng cUSD làm đơn vị cho vay/trả.
+ * 
+ * Quy trình:
+ * - Lender gửi cUSD vào hợp đồng (escrow) tạo offer.
+ * - Borrower nhận khoản vay (takeLoan).
+ * - Borrower hoàn trả gốc + lãi (repay).
+ * - Lender rút tiền về (withdrawLender).
+ * 
+ * Lãi suất tính đơn theo basis points (100 bps = 1%).
+ */
+
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-contract CollateralizedP2PLending is ReentrancyGuard {
-    struct Loan {
-        address borrower;
+// Nếu Remix không tải được OpenZeppelin, thay bằng import từ GitHub:
+// import "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/v5.0.2/contracts/security/ReentrancyGuard.sol";
+// import "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/v5.0.2/contracts/token/ERC20/IERC20.sol";
+
+contract P2PLending is ReentrancyGuard {
+    IERC20 public immutable cUSD;
+
+    enum OfferStatus { Funded, Taken, Repaid, Cancelled }
+
+    struct Offer {
         address lender;
-        IERC20 loanToken;        // e.g., cUSD/cEUR/cREAL (or any ERC20)
-        IERC20 collateralToken;  // any ERC20 used as collateral
-        uint256 principal;       // amount of loanToken requested
-        uint256 collateral;      // amount of collateralToken posted
-        uint256 interest;        // flat interest (loanToken units)
-        uint256 dueTimestamp;    // unix ts
-        uint256 minCollateralRatioBps; // e.g., 15000 = 150%
-        bool    funded;
-        bool    repaid;
-        bool    liquidated;
+        address borrower;
+        uint256 principal;      // số tiền (cUSD, decimals 18)
+        uint256 interestBps;    // 100 bps = 1%
+        uint256 duration;       // thời hạn (giây)
+        uint256 startAt;        // thời điểm borrower nhận tiền
+        OfferStatus status;
     }
 
-    uint256 public loanCount;
-    mapping(uint256 => Loan) public loans;
+    uint256 public nextOfferId;
+    mapping(uint256 => Offer) public offers;
 
-    event LoanRequested(
-        uint256 indexed loanId,
-        address indexed borrower,
-        address loanToken,
-        address collateralToken,
-        uint256 principal,
-        uint256 collateral,
-        uint256 interest,
-        uint256 dueTimestamp,
-        uint256 minCollateralRatioBps
-    );
-    event LoanFunded(uint256 indexed loanId, address indexed lender);
-    event LoanRepaid(uint256 indexed loanId);
-    event LoanLiquidated(uint256 indexed loanId);
+    // ======= Sự kiện =======
+    event OfferCreated(uint256 indexed id, address indexed lender, uint256 principal, uint256 interestBps, uint256 duration);
+    event OfferCancelled(uint256 indexed id);
+    event LoanTaken(uint256 indexed id, address indexed borrower);
+    event LoanRepaid(uint256 indexed id, uint256 repayAmount);
 
-    error NotBorrower();
+    // ======= Lỗi tuỳ chỉnh =======
     error NotLender();
-    error AlreadyFunded();
-    error NotFunded();
-    error AlreadyClosed();
-    error BadParams();
-    error CollateralTooLow();
+    error NotBorrower();
+    error BadStatus();
+    error TransferFailed();
 
-    function requestLoan(
-        address loanToken,
-        address collateralToken,
-        uint256 principal,
-        uint256 collateral,
-        uint256 interest,
-        uint256 dueTimestamp,
-        uint256 minCollateralRatioBps
-    ) external nonReentrant returns (uint256 id) {
-        if (
-            loanToken == address(0) ||
-            collateralToken == address(0) ||
-            principal == 0 ||
-            collateral == 0 ||
-            dueTimestamp <= block.timestamp ||
-            minCollateralRatioBps < 10000 // must be >= 100%
-        ) revert BadParams();
+    constructor(address cUSDAddress) {
+        require(cUSDAddress != address(0), "cUSD=0");
+        cUSD = IERC20(cUSDAddress);
+    }
 
-        // Simple on-chain check: collateral >= principal * ratio
-        // (No oracle here—devs can later plug a price feed.)
-        if (collateral * 10000 < principal * minCollateralRatioBps) revert CollateralTooLow();
+    // ======= Tạo offer (Lender) =======
+    function createOffer(uint256 principal, uint256 interestBps, uint256 duration)
+        external
+        nonReentrant
+        returns (uint256 id)
+    {
+        require(principal > 0, "principal=0");
+        require(duration > 0, "duration=0");
 
-        id = ++loanCount;
-        loans[id] = Loan({
-            borrower: msg.sender,
-            lender: address(0),
-            loanToken: IERC20(loanToken),
-            collateralToken: IERC20(collateralToken),
+        id = nextOfferId++;
+        offers[id] = Offer({
+            lender: msg.sender,
+            borrower: address(0),
             principal: principal,
-            collateral: collateral,
-            interest: interest,
-            dueTimestamp: dueTimestamp,
-            minCollateralRatioBps: minCollateralRatioBps,
-            funded: false,
-            repaid: false,
-            liquidated: false
+            interestBps: interestBps,
+            duration: duration,
+            startAt: 0,
+            status: OfferStatus.Funded
         });
 
-        // Pull collateral from borrower
-        require(loans[id].collateralToken.transferFrom(msg.sender, address(this), collateral), "collateral xfer failed");
+        bool ok = cUSD.transferFrom(msg.sender, address(this), principal);
+        if (!ok) revert TransferFailed();
 
-        emit LoanRequested(
-            id, msg.sender, loanToken, collateralToken,
-            principal, collateral, interest, dueTimestamp, minCollateralRatioBps
-        );
+        emit OfferCreated(id, msg.sender, principal, interestBps, duration);
     }
 
-    function cancelUnfunded(uint256 id) external nonReentrant {
-        Loan storage L = loans[id];
-        if (L.borrower != msg.sender) revert NotBorrower();
-        if (L.funded) revert AlreadyFunded();
-        if (L.repaid || L.liquidated) revert AlreadyClosed();
+    // ======= Hủy offer (Lender) =======
+    function cancelOffer(uint256 id) external nonReentrant {
+        Offer storage o = offers[id];
+        if (msg.sender != o.lender) revert NotLender();
+        if (o.status != OfferStatus.Funded) revert BadStatus();
 
-        // Return collateral
-        require(L.collateralToken.transfer(L.borrower, L.collateral), "return collateral failed");
-        delete loans[id]; // save storage
+        o.status = OfferStatus.Cancelled;
+        bool ok = cUSD.transfer(o.lender, o.principal);
+        if (!ok) revert TransferFailed();
+
+        emit OfferCancelled(id);
     }
 
-    function fund(uint256 id) external nonReentrant {
-        Loan storage L = loans[id];
-        if (L.funded) revert AlreadyFunded();
-        if (L.repaid || L.liquidated) revert AlreadyClosed();
+    // ======= Borrower nhận khoản vay =======
+    function takeLoan(uint256 id) external nonReentrant {
+        Offer storage o = offers[id];
+        if (o.status != OfferStatus.Funded) revert BadStatus();
 
-        L.lender = msg.sender;
-        L.funded = true;
+        o.status = OfferStatus.Taken;
+        o.borrower = msg.sender;
+        o.startAt = block.timestamp;
 
-        // Transfer principal to borrower
-        require(L.loanToken.transferFrom(msg.sender, L.borrower, L.principal), "principal xfer failed");
+        bool ok = cUSD.transfer(msg.sender, o.principal);
+        if (!ok) revert TransferFailed();
 
-        emit LoanFunded(id, msg.sender);
+        emit LoanTaken(id, msg.sender);
     }
 
+    // ======= Borrower hoàn trả =======
     function repay(uint256 id) external nonReentrant {
-        Loan storage L = loans[id];
-        if (!L.funded) revert NotFunded();
-        if (L.borrower != msg.sender) revert NotBorrower();
-        if (L.repaid || L.liquidated) revert AlreadyClosed();
+        Offer storage o = offers[id];
+        if (msg.sender != o.borrower) revert NotBorrower();
+        if (o.status != OfferStatus.Taken) revert BadStatus();
 
-        // Transfer principal + interest from borrower to lender
-        uint256 pay = L.principal + L.interest;
-        require(L.loanToken.transferFrom(msg.sender, L.lender, pay), "repay xfer failed");
+        uint256 repayAmt = _repayAmount(o);
+        bool ok = cUSD.transferFrom(msg.sender, address(this), repayAmt);
+        if (!ok) revert TransferFailed();
 
-        L.repaid = true;
-
-        // Return collateral to borrower
-        require(L.collateralToken.transfer(L.borrower, L.collateral), "collateral return failed");
-
-        emit LoanRepaid(id);
+        o.status = OfferStatus.Repaid;
+        emit LoanRepaid(id, repayAmt);
     }
 
-    function liquidate(uint256 id) external nonReentrant {
-        Loan storage L = loans[id];
-        if (!L.funded) revert NotFunded();
-        if (L.repaid || L.liquidated) revert AlreadyClosed();
-        if (block.timestamp <= L.dueTimestamp) revert BadParams(); // too early
+    // ======= Lender rút tiền sau khi borrower repay =======
+    function withdrawLender(uint256 id) external nonReentrant {
+        Offer storage o = offers[id];
+        if (msg.sender != o.lender) revert NotLender();
+        if (o.status != OfferStatus.Repaid) revert BadStatus();
 
-        L.liquidated = true;
-
-        // Send collateral to lender
-        require(L.collateralToken.transfer(L.lender, L.collateral), "collateral to lender failed");
-
-        emit LoanLiquidated(id);
+        uint256 repayAmt = _repayAmount(o);
+        o.status = OfferStatus.Cancelled; // chốt trạng thái
+        bool ok = cUSD.transfer(o.lender, repayAmt);
+        if (!ok) revert TransferFailed();
     }
 
-    // Helpers
-    function getLoan(uint256 id) external view returns (Loan memory) {
-        return loans[id];
+    // ======= Xem tổng số tiền borrower phải trả =======
+    function repayAmount(uint256 id) external view returns (uint256) {
+        return _repayAmount(offers[id]);
+    }
+
+    // ======= Hàm nội bộ tính gốc+lãi =======
+    function _repayAmount(Offer storage o) internal view returns (uint256) {
+        uint256 interest = (o.principal * o.interestBps) / 10_000;
+        return o.principal + interest;
     }
 }
